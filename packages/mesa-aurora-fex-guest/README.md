@@ -19,9 +19,10 @@ This follows the principle of independently maintained guest graphics layers.
 composes rootfs layers with overlayfs; MUVM also supports `-f BASE -f LAYER`
 for EROFS images. For an existing writable Ubuntu directory, a versioned
 `/opt` prefix is simpler: no mounts, apt file replacements, diversions,
-systemd service, or global FEX configuration. Selection is explicit per
-application. This prefix/wrapper is an adaptation for this installation, not
-an upstream Fedora rootfs package.
+or systemd service. The optional default selector below makes this layer the
+user’s default for both FEX architectures through guest-only configuration.
+This prefix/configuration is an adaptation for this writable Ubuntu rootfs,
+not an upstream Fedora rootfs package.
 
 ### Build on aarch64 Linux
 
@@ -82,54 +83,135 @@ The installer copies only the new prefix and refuses to overwrite an existing
 version. Kisak's `/usr` files and dpkg records remain intact; apt does not own
 the `/opt/aurora-fex-mesa` files. Retain the staged tree or archive for reinstall.
 
-Run `with-mesa` **inside the x86 shell**. Do not export its `LD_LIBRARY_PATH`
-or `VK_DRIVER_FILES` on the outer ARM MUVM process: libkrun's renderer needs
-native ARM libraries. A fresh, isolated instance, run as `nugget`:
+### Make it the default for both FEX architectures
+
+Run this once **as the FEX user**, after installing the prefix:
+
+```sh
+python3 "$recipe/set-fex-default.py" enable \
+  "$HOME/.fex-emu/Config.json" "$rootfs" "$prefix"
+```
+
+Use the active configuration directory: this installation has the legacy
+`~/.fex-emu`, which FEX prefers over `~/.config/fex-emu`. The selector verifies
+`Config.RootFS`, both ELF architectures, ICD paths, and the EGL manifest. It
+backs up every changed file under `mesa-default-backup.*` before activation,
+preserves ownership/mode and unrelated settings, then prints its exact
+one-command rollback. Repeating activation for the same prefix is a no-op.
+Retain the helper at the printed path for rollback.
+
+`Config.Env` selects the following **inside emulated processes only**:
+
+- Both architecture library paths, DRI paths, and GBM backend paths.
+- Only the two matching Asahi ICDs through `VK_DRIVER_FILES` and the older
+  `VK_ICD_FILENAMES`; `library_arch` selects the correct ABI. Kisak's ICDs stay
+  installed but are excluded from discovery, including after apt upgrades.
+- Mesa's GLVND EGL manifest and GLX vendor, Zink, and M5 bring-up mode.
+
+FEX's `Env` string list uses **repeated `"Env": "KEY=value"` object keys**,
+not a JSON array. Generic JSON editors often silently discard all but the
+last key. The helper reads/writes object pairs so existing repeated Env and
+HostEnv settings survive. Existing AppConfig and pattern AppOverrides Env
+lists receive the same selection, retaining unrelated environment variables.
+
+GL/Vulkan thunks bypass guest Mesa, so the selector disables those two
+entries in global `ThunksDB` and any existing user AppConfig that explicitly
+sets them (including this machine's `WinBox.json`). Other thunks are retained.
+Wine prefixes and application launchers are not edited. Future deliberate
+AppConfig or launcher environment overrides can supersede these defaults;
+re-run the selector after adding an AppConfig that changes graphics settings.
+
+No `/usr` libraries, package manifests, dpkg state, loader cache, or native ARM
+configuration is changed. apt owns neither this versioned prefix nor these
+user FEX settings. This preserves the independently maintained graphics-layer
+principle without installing hooks, diversions, or a rootfs mount overlay.
+Keep the prefix installed while it is selected.
+
+### Launch without a wrapper
+
+Run as `nugget`, using a fresh runtime for each independent VM:
 
 ```sh
 rootfs=/home/nugget/.local/share/fex-emu/RootFS/Ubuntu_24_04
 runtime=$(mktemp -d /run/user/1000/muvm-fex-mesa.XXXXXXXX)
-# On desktops with X authentication, use the current /run/user/1000/xauth_*.
-# The tested Xwayland session had no -auth argument and needed no XAUTHORITY.
+# If /run/user/1000/xauth_* exists, export XAUTHORITY to the current file.
 DISPLAY=:0 XDG_RUNTIME_DIR="$runtime" ASAHI_M5_BRINGUP=1 \
 MESA_LOADER_DRIVER_OVERRIDE=zink \
-muvm --emu=fex --mem=4096 --vram=2048 \
+/usr/local/bin/muvm --emu=fex --mem=4096 --vram=2048 \
   -e ASAHI_M5_BRINGUP=1 -e MESA_LOADER_DRIVER_OVERRIDE=zink -- \
-  "$rootfs/usr/bin/bash" /opt/aurora-fex-mesa/df0e691a15/bin/with-mesa \
-  /usr/bin/vulkaninfo --summary
+  "$rootfs/usr/bin/vkcube" --c 10
 rm -rf -- "$runtime"
 ```
 
-Replace the last command with `/usr/bin/vkcube --c 10`,
-`/usr/bin/glxinfo -B`, or a 32-bit application. Keep each independent MUVM
-instance's runtime separate. The wrapper sets the two architecture library
-and DRI paths, both ICD manifests, Mesa's EGL vendor manifest, and Zink.
-It does not modify Wine prefixes, WinBox's app configuration, or default
-launchers. Existing launches remain opt-out until explicitly wrapped.
+The rootfs path selects the **x86_64 executable**, with no shell or Mesa
+wrapper. Replace it with `"$rootfs/usr/bin/glxinfo" -B`,
+`"$rootfs/usr/bin/vulkaninfo" --summary`, an i686 executable, or Wine.
+Normal Wine/WinBox/game launches automatically receive the new default when
+FEX starts them. Never export these x86 library/ICD paths on the outer ARM
+MUVM process: libkrun's renderer uses native ARM libraries.
 
-### Rollback
+On this machine `/usr/bin/vkcube` and `/usr/bin/glxinfo` are ARM64. The flag
+`--emu=fex` registers the x86 interpreter; it does not turn native executables
+into x86. Thus plain `muvm --emu=fex -- vkcube --c 10` with the usual PATH
+still tests native Mesa. To exercise the plain command name with x86 Mesa,
+put the rootfs bin directory first **in the VM's command lookup PATH**:
 
-Exit only applications you launched with this prefix. Normal unwrapped
-launches already use the original drivers. Remove the isolated prefix:
+```sh
+runtime=$(mktemp -d /run/user/1000/muvm-fex-mesa.XXXXXXXX)
+DISPLAY=:0 XDG_RUNTIME_DIR="$runtime" ASAHI_M5_BRINGUP=1 \
+MESA_LOADER_DRIVER_OVERRIDE=zink /usr/local/bin/muvm --emu=fex \
+  -e ASAHI_M5_BRINGUP=1 -e MESA_LOADER_DRIVER_OVERRIDE=zink \
+  -e "PATH=$rootfs/usr/bin:/usr/local/bin:/usr/bin" -- vkcube --c 10
+rm -rf -- "$runtime"
+```
+
+This is only an executable lookup choice. No library/ICD environment flags
+or Mesa wrapper are needed at launch. For one-off opt-in use instead of
+installing the default, `bin/with-mesa` remains available inside an x86 shell.
+
+### Rollback the default
+
+Run the exact command printed by activation, as the same user (or root):
+
+```sh
+python3 "$recipe/set-fex-default.py" rollback "$HOME/.fex-emu/mesa-default-backup.PRINTED_ID"
+```
+
+Rollback restores every changed config byte-for-byte, including the original
+WinBox thunk selection, with ownership/mode retained. It first checks all
+files and refuses to overwrite subsequent user edits. Backups and the Mesa
+payload remain available. The helper has been tested on the live J704 by
+rolling back, comparing both files to their originals, then enabling again.
+Existing VMs need not be stopped; freshly started FEX processes use the current
+selection. Do not remove the prefix until your applications using it exit.
+After rolling back the default, the old payload-removal command is optional:
 
 ```sh
 rm -rf -- /home/nugget/.local/share/fex-emu/RootFS/Ubuntu_24_04/opt/aurora-fex-mesa/df0e691a15
 ```
 
 No apt reinstall, dpkg-divert reversal, host package rollback, service restart,
-or FEX configuration edit is needed. Do not delete the prefix while an
-application still uses it. Rebuild and requalify the guest when the host Mesa
-source or experimental GPU UAPI changes.
+or reboot is needed. Rebuild/requalify the guest when the host Mesa source or
+experimental GPU UAPI changes.
 
 ## Hardware validation
 
-On 2026-11-05, with the J704's `mesa-j704` at the commit above and
-`virglrenderer-aurora 1.3.0-1`, a fresh `muvm --emu=fex` passed x86_64
-`vulkaninfo --summary`, ten-frame Vulkan cubes in both architectures, and
-x86_64/i686 Zink GL 4.6 queries. Both GL queries reported
-`26.3.0-devel (git-df0e691a15)` and `AURORA_BOREALIS`. The host kernel log
-had no new messages across the tests. The old Ubuntu Vulkan tool prints
-`UNKNOWN_VkDriverId_value35`, but correctly reports `driverName = Borealis`
-and the matching Mesa commit; loader diagnostics confirm the `/opt` ICD.
-Original Kisak libraries, dpkg status, FEX configuration, and WinBox app
-configuration retained their hashes. Wine and WinBox were not relaunched.
+On 2026-11-05, with J704 `mesa-j704 1:26.3.0_devel.df0e691-1` and
+`virglrenderer-aurora 1.3.0-1`, fresh VMs as `nugget` passed **unwrapped**
+x86_64 Vulkan enumeration and a ten-frame cube, x86_64/i686 Zink GL 4.6
+queries, an i686 ten-frame Vulkan cube, and x86_64 Wine `--version` and
+`cmd /c ver` in a temporary prefix (Windows 10.0.19045).
+GL reports `26.3.0-devel (git-df0e691a15)` / `AURORA_BOREALIS`; Vulkan reports
+Apple M5 (G17G C0), Borealis, the same commit, and a single device. Loader
+diagnostics confirm the `/opt` ICD of the correct ABI. Native plain `vkcube`
+also passes; rootfs-first VM PATH selects x86 for the same plain command name.
+Both ABIs also pass a direct one-device/commit query, EGL 1.5 initialization,
+and GBM device creation. Process mappings confirm EGL, GBM, its backend,
+Gallium, and Vulkan load from the matching `/opt` architecture directory.
+The host kernel log had no new messages across all tests.
+The old Ubuntu Vulkan tool prints `UNKNOWN_VkDriverId_value35`, but correctly
+reports `driverName = Borealis` and the matching Mesa commit.
+
+Kisak libraries/ICDs, dpkg state, and host packages are preserved. FEX and
+WinBox configs are backed up; Wine prefixes and launchers are not edited.
+This qualifies the smoke tests above, not all games or experimental M5 rendering.
