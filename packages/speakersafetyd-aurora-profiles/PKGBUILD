@@ -1,14 +1,15 @@
 pkgname=speakersafetyd-aurora-profiles
 pkgver=1
-pkgrel=1
+pkgrel=2
 pkgdesc='speakersafetyd profiles for Aurora-supported Macs and warm restarts'
 arch=('any')
 groups=('aurora-platform-apple-silicon')
 url='https://github.com/aurora-silicon/alarm-aurora'
 license=('GPL-2.0-only')
-source=('j616.conf' '96-speakersafetyd-aurora.rules' '50-aurora-warm-restart.conf')
+source=('j616.conf' 'j704.conf' '96-speakersafetyd-aurora.rules' '50-aurora-warm-restart.conf')
 sha256sums=('a410bfd1a17cb4ebaed95278152029c6e9dd5862d52a918c12a4b3db01f0ffaf'
-            '40363041bdbe7b3686212ae1bd58dcb369253a921e45e6cb7c78cfb37787e7c3'
+            'd8f054aba53dba8c7a95138a5dd9f02b747040bb8bf5508550e7dbb81cc75de0'
+            'cc267543a17b93f750e73b7370a2e7703850f2371c38c61688e9d5c05403988e'
             '63e866903fec3e48c810d67fe86e8e1ba17253644e3de9ac2dfc2a562591a521')
 package() {
   # speakersafetyd comes from asahi-alarm; the profile files build without it.
@@ -17,6 +18,9 @@ package() {
   # values with the J616 V/I sense layout. Without a running daemon the
   # kernel keeps the speaker volumes locked.
   install -Dm644 j616.conf "$pkgdir/usr/share/speakersafetyd/apple/j616.conf"
+  # The J704 (MacBook Pro 14-inch M5) model: speakersafetyd's J504 profile,
+  # whose values match the J704's own speaker-protection tuning.
+  install -Dm644 j704.conf "$pkgdir/usr/share/speakersafetyd/apple/j704.conf"
   install -Dm644 96-speakersafetyd-aurora.rules "$pkgdir/usr/lib/udev/rules.d/96-speakersafetyd-aurora.rules"
   # A restart within the same boot starts from the worst-case temperature.
   install -Dm644 50-aurora-warm-restart.conf "$pkgdir/usr/lib/systemd/system/speakersafetyd.service.d/50-aurora-warm-restart.conf"

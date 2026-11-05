@@ -8,5 +8,6 @@ GOTO="aurora_speakersafetyd_end"
 
 LABEL="aurora_speakersafetyd_macaudio"
 KERNEL=="pcmC*D2c", ATTRS{id}=="AppleJ616", TAG+="systemd", ENV{SYSTEMD_WANTS}="speakersafetyd.service"
+KERNEL=="pcmC*D2c", ATTRS{id}=="AppleJ704", TAG+="systemd", ENV{SYSTEMD_WANTS}="speakersafetyd.service"
 
 LABEL="aurora_speakersafetyd_end"
