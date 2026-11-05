@@ -1,0 +1,42 @@
+# Based on Arch's virglrenderer 1.3.0-2 recipe (heftig, anatolik).
+pkgname=virglrenderer-aurora
+pkgver=1.3.0
+pkgrel=1
+pkgdesc='Virglrenderer with Aurora DRM native-context compatibility'
+arch=('aarch64' 'x86_64')
+url='https://virgil3d.github.io/'
+license=('MIT')
+provides=("virglrenderer=$pkgver" 'libvirglrenderer.so')
+conflicts=('virglrenderer')
+depends=('glibc' 'libdrm' 'libepoxy' 'libgcc' 'libsysprof-capture' 'libva' 'libx11' 'mesa')
+makedepends=('check' 'meson' 'ninja' 'python' 'python-yaml' 'vulkan-headers')
+source=("https://gitlab.freedesktop.org/virgl/virglrenderer/-/archive/$pkgver/virglrenderer-$pkgver.tar.gz"
+        0001-drm-accept-aurora-as-an-asahi-alias.patch
+        check-backend-names.sh
+        backend-names.c)
+sha256sums=('065bc56e89e6f631f96101cd62eba0748e48eb888b434edc86e89d05395e76f3'
+            '25d7b9570890a68fa5a7da523ad8a5bdfe7cc1cd256cf78993412e843d1f29ea'
+            '4f4dcc04f92dae133e0b92573c35ec69604226cac672b7276cc365dd59fccc45'
+            '33044def5f9515d94a64e976970e890c21ed6b9cefc96a53813fce1458b9fdf5')
+
+prepare() {
+  patch -d "virglrenderer-$pkgver" -Np1 -i "$srcdir/0001-drm-accept-aurora-as-an-asahi-alias.patch"
+}
+
+build() {
+  # Retain Arch's enabled renderers and features.
+  arch-meson "virglrenderer-$pkgver" build \
+    -Ddrm-renderers=amdgpu-experimental,panfrost-experimental,asahi,msm,i915-experimental \
+    -Dtests=true -Dtracing=sysprof -Dvenus=true -Dvideo=true
+  meson compile -C build
+}
+
+check() {
+  sh "$srcdir/check-backend-names.sh" "$srcdir/virglrenderer-$pkgver"
+  VRENDTEST_USE_EGL_SURFACELESS=1 meson test -C build --print-errorlogs
+}
+
+package() {
+  meson install -C build --destdir "$pkgdir"
+  install -Dm644 "virglrenderer-$pkgver/COPYING" "$pkgdir/usr/share/licenses/$pkgname/COPYING"
+}

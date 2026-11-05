@@ -1,0 +1,63 @@
+--- a/src/drm/drm_renderer.c
++++ b/src/drm/drm_renderer.c
+@@ -43,6 +43,7 @@
+ static const struct backend {
+    uint32_t context_type;
+    const char *name;
++   const char *alias;
+    int (*probe)(int fd, struct virgl_renderer_capset_drm *capset);
+    struct virgl_context *(*create)(int fd, size_t debug_len, const char *debug_name);
+ } backends[] = {
+@@ -66,6 +67,8 @@
+    {
+       .context_type = VIRTGPU_DRM_CONTEXT_ASAHI,
+       .name = "asahi",
++      /* Aurora keeps the Asahi ioctls and native-context protocol. */
++      .alias = "aurora",
+       .probe = asahi_renderer_probe,
+       .create = asahi_renderer_create,
+    },
+@@ -88,6 +91,15 @@
+ #endif
+ };
+ 
++static int
++drm_backend_open(const struct backend *b)
++{
++   int fd = drmOpenWithType(b->name, NULL, DRM_NODE_RENDER);
++   if (fd < 0 && b->alias)
++      fd = drmOpenWithType(b->alias, NULL, DRM_NODE_RENDER);
++   return fd;
++}
++
+ int
+ drm_renderer_init(int drm_fd)
+ {
+@@ -98,7 +110,7 @@
+       if (drm_fd != -1) {
+          fd = drm_fd;
+       } else {
+-         fd = drmOpenWithType(b->name, NULL, DRM_NODE_RENDER);
++         fd = drm_backend_open(b);
+          if (fd < 0)
+             continue;
+       }
+@@ -109,7 +121,8 @@
+          return -ENOMEM;
+       }
+ 
+-      if (strcmp(ver->name, b->name)) {
++      if (strcmp(ver->name, b->name) &&
++          (!b->alias || strcmp(ver->name, b->alias))) {
+          /* In the drmOpenWithType() path, we will only get back an fd
+           * for the device with matching name.  But when we are using
+           * an externally provided fd, we need to go thru the backends
+@@ -175,7 +188,7 @@
+ 
+       int fd = drm_fd;
+       if (fd < 0)
+-         fd = drmOpenWithType(b->name, NULL, DRM_NODE_RENDER);
++         fd = drm_backend_open(b);
+       if (fd < 0)
+          return NULL;
+ 
