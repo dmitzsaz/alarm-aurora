@@ -1,4 +1,6 @@
 # x86 payload for the aarch64 FEX host. CI builds this recipe on x86_64 Arch.
+# For a J704 Ubuntu directory rootfs, use build-ubuntu-multiarch.sh (README.md);
+# the Arch payload is not ABI-compatible with arbitrary Ubuntu rootfs releases.
 pkgname=mesa-aurora-fex-guest
 epoch=1
 pkgver=26.3.0_devel.202611042334.c1753704ed7
@@ -36,12 +38,12 @@ build() {
   unset CFLAGS CXXFLAGS CPPFLAGS LDFLAGS PKG_CONFIG_PATH
   local common=(--prefix=/usr --buildtype=release -Db_ndebug=true --wrap-mode=nodownload
     -Dplatforms=x11,wayland -Dgallium-drivers=asahi,zink,softpipe -Dvulkan-drivers=asahi
-    -Dvulkan-layers= -Dglx=dri -Degl=enabled -Dgbm=enabled -Dgles1=disabled -Dgles2=enabled
+    -Dvulkan-manifest-per-architecture=true -Dvulkan-layers= -Dglx=dri -Degl=enabled -Dgbm=enabled -Dgles1=disabled -Dgles2=enabled
     -Dglvnd=enabled -Dgallium-rusticl=false -Dbuild-tests=false -Dvalgrind=disabled
     -Dvideo-codecs= -Dmicrosoft-clc=disabled -Dlibunwind=disabled -Dlmsensors=disabled)
   PKG_CONFIG_LIBDIR=/usr/lib/pkgconfig:/usr/share/pkgconfig \
     meson setup tools "${common[@]}" --libdir=lib64 -Dllvm=enabled
-  ninja -C tools -j"${OMARCHY_BUILD_JOBS:-10}" \
+  ninja -C tools -j"${OMARCHY_BUILD_JOBS:-2}" \
     src/compiler/clc/mesa_clc src/compiler/spirv/vtn_bindgen2 src/asahi/clc/asahi_clc
   printf '%s\n' '[binaries]' \
     "mesa_clc = '$PWD/tools/src/compiler/clc/mesa_clc'" \
@@ -51,7 +53,7 @@ build() {
     -Dprecomp-compiler=system --native-file tools.ini)
   PKG_CONFIG_LIBDIR=/usr/lib/pkgconfig:/usr/share/pkgconfig \
     meson setup b64 "${common[@]}" "${drivers[@]}" --libdir=lib64
-  ninja -C b64 -j"${OMARCHY_BUILD_JOBS:-10}"
+  ninja -C b64 -j"${OMARCHY_BUILD_JOBS:-2}"
   cat > i686.cross <<'EOF'
 [binaries]
 c = ['gcc', '-m32']
@@ -68,13 +70,26 @@ cpu = 'i686'
 endian = 'little'
 EOF
   meson setup b32 "${common[@]}" "${drivers[@]}" --libdir=lib --cross-file i686.cross
-  ninja -C b32 -j"${OMARCHY_BUILD_JOBS:-10}"
+  ninja -C b32 -j"${OMARCHY_BUILD_JOBS:-2}"
   DESTDIR="$srcdir/layer" meson install -C b64 --no-rebuild
   DESTDIR="$srcdir/layer" meson install -C b32 --no-rebuild
 }
 
 check() {
   local bits directory binary dependencies
+  # Keep an architecture-specific absolute path for each ICD; the 32-bit
+  # installation must never silently replace the 64-bit manifest.
+  python3 - "$srcdir/layer" <<'PYICD' || return 1
+import json
+from pathlib import Path
+import sys
+layer = Path(sys.argv[1])
+for arch, libdir, bits in [('x86_64', 'lib64', '64'), ('i686', 'lib', '32')]:
+    path = layer / f'usr/share/vulkan/icd.d/asahi_icd.{arch}.json'
+    icd = json.loads(path.read_text())['ICD']
+    assert icd['library_path'] == f'/usr/{libdir}/libvulkan_asahi.so', icd
+    assert icd['library_arch'] == bits, icd
+PYICD
   for bits in 64 32; do
     directory=lib64
     [[ $bits == 64 ]] || directory=lib

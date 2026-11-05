@@ -1,0 +1,11 @@
+#!/bin/sh
+# Run this shell INSIDE FEX, after MUVM has initialized its native renderer.
+# Keep the layer opt-in: existing Wine/WinBox launches retain their environment.
+prefix='@PREFIX@'
+export LD_LIBRARY_PATH="$prefix/lib/x86_64-linux-gnu:$prefix/lib/i386-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LIBGL_DRIVERS_PATH="$prefix/lib/x86_64-linux-gnu/dri:$prefix/lib/i386-linux-gnu/dri"
+export VK_DRIVER_FILES="$prefix/share/vulkan/icd.d/asahi_icd.x86_64.json:$prefix/share/vulkan/icd.d/asahi_icd.i686.json"
+export VK_ICD_FILENAMES="$VK_DRIVER_FILES"
+export __EGL_VENDOR_LIBRARY_FILENAMES="$prefix/share/glvnd/egl_vendor.d/50_mesa.json"
+export MESA_LOADER_DRIVER_OVERRIDE=zink
+exec "$@"
