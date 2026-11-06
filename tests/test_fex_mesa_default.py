@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'packages/mesa-aurora-fex-guest/set-fex-default.py'
@@ -36,6 +37,16 @@ class FexMesaDefaultTests(unittest.TestCase):
         egl = layer / 'share/glvnd/egl_vendor.d/50_mesa.json'
         egl.parent.mkdir(parents=True)
         egl.write_text('{"ICD":{"library_path":"libEGL_mesa.so.0"}}')
+        (self.rootfs / 'etc/ld.so.conf.d').mkdir(parents=True)
+        (self.rootfs / 'etc/ld.so.cache').write_bytes(b'original-cache')
+        icd = self.rootfs / 'usr/share/vulkan/icd.d/asahi_icd.json'
+        icd.parent.mkdir(parents=True)
+        icd.write_text('{"ICD":{"library_path":"libvulkan_asahi.so"}}')
+        self.cache_mock = patch.object(module, 'guest_cache', return_value=b'selected-cache').start()
+        self.addCleanup(patch.stopall)
+        cache_listing = '\n'.join(f'=> {self.prefix}/lib/{a}/libvulkan_asahi.so'
+                                  for a in ('x86_64-linux-gnu', 'i386-linux-gnu'))
+        patch.object(module.subprocess, 'run', return_value=type('Result', (), {'stdout': cache_listing})()).start()
         self.config = self.base / 'Config.json'
         self.config.write_text('{"Config":{"RootFS":' + json.dumps(str(self.rootfs)) +
             ',"Env":"KEEP=a","Env":"KEEP_TOO=b","HostEnv":"A=1","HostEnv":"B=2"}}\n')
@@ -48,41 +59,53 @@ class FexMesaDefaultTests(unittest.TestCase):
         module.enable(self.config, self.rootfs, self.prefix)
         return next(self.base.glob('mesa-default-backup.*'))
 
-    def test_default_is_idempotent_and_rollback_restores_exact_originals(self):
-        before = {p: p.read_bytes() for p in (self.config, self.app)}
+    def test_thunks_and_user_environment_survive_activation_and_exact_rollback(self):
+        self.config.write_text(self.config.read_text().rstrip()[:-1] +
+                               ',"ThunksDB":{"GL":1,"Vulkan":1}}')
+        before = {p: p.read_bytes() for p in (self.config, self.app, self.rootfs / 'etc/ld.so.cache')}
         backup = self.enable()
         settings = module.load(self.config).get('Config')
         env = [v for k, v in settings if k == 'Env']
         self.assertIn('KEEP=a', env)
         self.assertIn('KEEP_TOO=b', env)
-        self.assertIn('VK_DRIVER_FILES=' + module.environment(self.prefix)['VK_DRIVER_FILES'], env)
+        self.assertIn('VK_LOADER_DRIVERS_SELECT=asahi*', env)
+        self.assertFalse(any('/opt/' in v for v in env))
         self.assertEqual([v for k, v in settings if k == 'HostEnv'], ['A=1', 'B=2'])
-        thunks = module.load(self.app).get('ThunksDB')
-        self.assertEqual((thunks.get('GL'), thunks.get('Vulkan'), thunks.get('asound')), (0, 0, 1))
+        self.assertEqual(json.loads(self.config.read_text())['ThunksDB'], {'GL': 1, 'Vulkan': 1})
+        self.assertEqual(self.app.read_bytes(), before[self.app])
         self.enable()
         self.assertEqual(len(list(self.base.glob('mesa-default-backup.*'))), 1)
         module.rollback(backup)
         for p, data in before.items():
             self.assertEqual(p.read_bytes(), data)
+        self.assertFalse((self.rootfs / 'etc/ld.so.conf.d/00-aurora-fex-mesa.conf').exists())
         self.assertEqual(self.config.stat().st_mode & 0o777, 0o640)
 
-    def test_rollback_preflights_every_file_before_restoring_any(self):
+    def test_rollback_preflights_new_files_before_restoring_any(self):
         backup = self.enable()
         enabled = self.config.read_bytes()
-        self.app.write_text(self.app.read_text() + ' ')
+        conf = self.rootfs / 'etc/ld.so.conf.d/00-aurora-fex-mesa.conf'
+        conf.write_text('user edit')
         with self.assertRaisesRegex(ValueError, 'changed since activation'):
             module.rollback(backup)
         self.assertEqual(self.config.read_bytes(), enabled)
+        self.assertEqual(conf.read_text(), 'user edit')
 
-    def test_app_environment_gets_both_architectures_and_keeps_other_options(self):
-        self.app.write_text('{"Config":{"Env":"APP=1","Env":"VK_DRIVER_FILES=/old.json","TSOEnabled":"1"}}')
+    def test_apt_cache_change_refuses_rollback_without_deleting_conf(self):
+        backup = self.enable()
+        conf = self.rootfs / 'etc/ld.so.conf.d/00-aurora-fex-mesa.conf'
+        (self.rootfs / 'etc/ld.so.cache').write_bytes(b'apt-rebuilt-cache')
+        with self.assertRaisesRegex(ValueError, 'changed since activation'):
+            module.rollback(backup)
+        self.assertTrue(conf.exists())
+
+    def test_explicit_app_and_pattern_settings_are_never_edited(self):
+        self.app.write_text('{"Config":{"Env":"APP=1","Env":"VK_DRIVER_FILES=/custom.json"},'
+                            '"AppOverrides":{"game*":{"Env":"OTHER=1"}},"ThunksDB":{"Vulkan":1}}')
+        before = self.app.read_bytes()
         self.enable()
-        settings = module.load(self.app).get('Config')
-        env = [v for k, v in settings if k == 'Env']
-        self.assertIn('APP=1', env)
-        self.assertFalse(any('/old.json' in v for v in env))
-        self.assertEqual(settings.get('TSOEnabled'), '1')
-        self.assertTrue(any('asahi_icd.x86_64.json:' in v and 'asahi_icd.i686.json' in v for v in env))
+        self.assertEqual(self.app.read_bytes(), before)
+        self.assertIsNone(module.load(self.config).get('ThunksDB'))
 
     def test_wrong_i686_payload_is_rejected_without_mutation(self):
         before = self.config.read_bytes()
@@ -93,16 +116,29 @@ class FexMesaDefaultTests(unittest.TestCase):
         self.assertEqual(self.config.read_bytes(), before)
         self.assertFalse(list(self.base.glob('mesa-default-backup.*')))
 
-    def test_pattern_override_cannot_leave_stale_icds_selected(self):
-        self.app.write_text('{"AppOverrides":{"game*":{"Env":"VK_ICD_FILENAMES=/old.json","Env":"OTHER=1"}},"Metadata":[{"keep":true}]}')
+    def test_cache_generation_failure_leaves_all_files_untouched(self):
+        self.cache_mock.side_effect = OSError('binfmt unavailable')
+        before = self.config.read_bytes()
+        with self.assertRaisesRegex(OSError, 'binfmt unavailable'):
+            self.enable()
+        self.assertEqual(self.config.read_bytes(), before)
+        self.assertEqual((self.rootfs / 'etc/ld.so.cache').read_bytes(), b'original-cache')
+        self.assertFalse(list(self.base.glob('mesa-default-backup.*')))
+
+    def test_user_graphics_defaults_win(self):
+        self.config.write_text('{"Config":{"RootFS":' + json.dumps(str(self.rootfs)) +
+                               ',"Env":"VK_LOADER_DRIVERS_SELECT=custom*.json"}}')
         self.enable()
-        doc = module.load(self.app)
-        override = doc.get('AppOverrides').get('game*')
-        env = [v for k, v in override if k == 'Env']
-        self.assertIn('OTHER=1', env)
-        self.assertFalse(any('/old.json' in v for v in env))
-        self.assertTrue(any(v.startswith('LD_LIBRARY_PATH=') for v in env))
-        self.assertEqual(json.loads(self.app.read_text())['Metadata'], [{'keep': True}])
+        env = [v for k, v in module.load(self.config).get('Config') if k == 'Env']
+        self.assertIn('VK_LOADER_DRIVERS_SELECT=custom*.json', env)
+        self.assertNotIn('VK_LOADER_DRIVERS_SELECT=asahi*', env)
+
+    def test_old_exclusive_default_must_be_rolled_back_first(self):
+        self.config.write_text('{"Config":{"RootFS":' + json.dumps(str(self.rootfs)) +
+                               ',"Env":"LD_LIBRARY_PATH=/opt/aurora-fex-mesa/old/lib"}}')
+        with self.assertRaisesRegex(ValueError, 'Rollback the old'):
+            self.enable()
+        self.assertFalse(list(self.base.glob('mesa-default-backup.*')))
 
 
 if __name__ == '__main__':

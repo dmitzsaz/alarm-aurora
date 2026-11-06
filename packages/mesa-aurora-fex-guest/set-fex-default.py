@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Select an installed Ubuntu Mesa prefix in FEX's guest environment only.
+"""Select Ubuntu guest Mesa without changing the user's graphics thunks.
 
 FEX stores string lists as repeated JSON keys, not JSON arrays. Preserve all
 object pairs, including unrelated repeated settings, when editing its files.
@@ -13,6 +13,7 @@ import re
 import shlex
 import shutil
 import stat
+import subprocess
 import tempfile
 
 
@@ -44,17 +45,12 @@ def load(path):
 
 
 def environment(prefix):
-    lib = [f'{prefix}/lib/{a}' for a in ('x86_64-linux-gnu', 'i386-linux-gnu')]
-    icds = ':'.join(f'{prefix}/share/vulkan/icd.d/asahi_icd.{a}.json'
-                    for a in ('x86_64', 'i686'))
+    # No guest paths may enter a native exec/pressure-vessel/thunk environment.
+    # The stock Ubuntu manifest uses a soname resolved by the guest ld.so.cache.
+    # This glob also matches the host's asahi_icd.aarch64.json. Exclude software
+    # ICDs without imposing x86 manifests on a native Vulkan loader.
     return {
-        'LD_LIBRARY_PATH': ':'.join(lib),
-        'LIBGL_DRIVERS_PATH': ':'.join(p + '/dri' for p in lib),
-        'GBM_BACKENDS_PATH': ':'.join(p + '/gbm' for p in lib),
-        'VK_DRIVER_FILES': icds,
-        'VK_ICD_FILENAMES': icds,
-        '__EGL_VENDOR_LIBRARY_FILENAMES': f'{prefix}/share/glvnd/egl_vendor.d/50_mesa.json',
-        '__GLX_VENDOR_LIBRARY_NAME': 'mesa',
+        'VK_LOADER_DRIVERS_SELECT': 'asahi*',
         'MESA_LOADER_DRIVER_OVERRIDE': 'zink',
         'ASAHI_M5_BRINGUP': '1',
     }
@@ -103,6 +99,30 @@ def atomic_write(path, content, metadata):
             os.unlink(tmp)
 
 
+def guest_cache(rootfs, prefix):
+    """Run the rootfs's x86 ldconfig via binfmt (inside MUVM), without mutation.
+
+    A custom -C disables the auxiliary cache; -X forbids symlink updates. Never
+    use the native ARM ldconfig to generate x86 cache architecture flags.
+    """
+    with tempfile.TemporaryDirectory(prefix='aurora-fex-ldconfig-') as tmp:
+        conf = Path(tmp) / 'ld.so.conf'
+        cache = Path(tmp) / 'ld.so.cache'
+        conf.write_text(f'{prefix}/lib/x86_64-linux-gnu\n'
+                        f'{prefix}/lib/i386-linux-gnu\ninclude /etc/ld.so.conf\n')
+        subprocess.run([str(rootfs / 'sbin/ldconfig.real'), '-X', '-i',
+                        '-f', str(conf), '-C', str(cache)], check=True)
+        contents = subprocess.run([str(rootfs / 'sbin/ldconfig.real'), '-p',
+                                   '-C', str(cache)], check=True,
+                                  capture_output=True, text=True).stdout
+        for triplet in ('x86_64-linux-gnu', 'i386-linux-gnu'):
+            for soname in ('libvulkan_asahi.so', 'libGLX_mesa.so.0',
+                           'libEGL_mesa.so.0', 'libgbm.so.1'):
+                if f'=> {prefix}/lib/{triplet}/{soname}' not in contents:
+                    raise ValueError(f'Generated cache is missing {triplet}/{soname}')
+        return cache.read_bytes()
+
+
 def enable(config, rootfs, prefix):
     rootfs = rootfs.resolve()
     validate(rootfs, prefix)
@@ -111,44 +131,39 @@ def enable(config, rootfs, prefix):
     if not isinstance(settings, Object) or Path(settings.get('RootFS', '')).resolve() != rootfs:
         raise ValueError('Config.RootFS does not match the supplied rootfs')
     env = environment(prefix)
-    # Include existing AppConfig overrides: their Env list can mask global Env.
-    files = [(config, main, settings)]
-    for path in sorted((config.parent / 'AppConfig').glob('*.json')):
-        doc = load(path)
-        app = doc.get('Config')
-        files.append((path, doc, app))
+    entries = [v for k, v in settings if k == 'Env']
+    if any(not isinstance(v, str) or '=' not in v for v in entries):
+        raise ValueError('Env must use repeated string keys, not arrays')
+    if any('/opt/aurora-fex-mesa/' in v for v in entries):
+        raise ValueError('Rollback the old environment-based default before enabling this one')
+    # Existing user overrides win. AppConfig, AppOverrides, ThunksDB, HostEnv,
+    # FEX_APP_CONFIG and launcher environment variables are never edited.
+    existing = {v.split('=', 1)[0] for v in entries}
+    settings.extend(('Env', k + '=' + v) for k, v in env.items() if k not in existing)
+    ldconf = rootfs / 'etc/ld.so.conf.d/00-aurora-fex-mesa.conf'
+    ldcontent = (f'# Managed by set-fex-default.py; guest libraries only.\n'
+                 f'{prefix}/lib/x86_64-linux-gnu\n{prefix}/lib/i386-linux-gnu\n').encode()
+    icd = json.loads((rootfs / 'usr/share/vulkan/icd.d/asahi_icd.json').read_text())
+    if icd['ICD']['library_path'] != 'libvulkan_asahi.so':
+        raise ValueError('Expected Ubuntu Asahi ICD using the libvulkan_asahi.so soname')
+    desired = [(config, (encode(main) + '\n').encode()), (ldconf, ldcontent)]
+    # Check idempotence before running ldconfig (whose cache may contain a
+    # timestamp). APT's normal ldconfig trigger retains our first-priority conf.
+    if all(p.is_file() and p.read_bytes() == data for p, data in desired):
+        contents = subprocess.run([str(rootfs / 'sbin/ldconfig.real'), '-p'],
+                                  check=True, capture_output=True, text=True).stdout
+        if all(f'=> {prefix}/lib/{a}/libvulkan_asahi.so' in contents
+               for a in ('x86_64-linux-gnu', 'i386-linux-gnu')):
+            print('Already selected; no files changed.')
+            return
+    desired.append((rootfs / 'etc/ld.so.cache', guest_cache(rootfs, prefix)))
     changes = []
-    for path, doc, section in files:
-        before = path.read_bytes()
-        overrides = doc.get('AppOverrides', Object())
-        if not isinstance(overrides, Object):
-            raise ValueError(f'Expected AppOverrides object: {path}')
-        for section in [section, *(v for _, v in overrides)]:
-            if section is None:
-                continue
-            if not isinstance(section, Object):
-                raise ValueError(f'Expected Config object: {path}')
-            # Keep arbitrary existing Env entries; replace only graphics settings.
-            entries = [(k, v) for k, v in section if k == 'Env']
-            if any(not isinstance(v, str) or '=' not in v for _, v in entries):
-                raise ValueError(f'Env must use repeated string keys, not arrays: {path}')
-            if section is settings or entries:
-                section[:] = [(k, v) for k, v in section
-                              if k != 'Env' or v.split('=', 1)[0] not in env]
-                section.extend(('Env', k + '=' + v) for k, v in env.items())
-        thunks = doc.get('ThunksDB')
-        if path == config and thunks is None:
-            thunks = Object()
-            doc.put('ThunksDB', thunks)
-        if thunks is not None:
-            if not isinstance(thunks, Object):
-                raise ValueError(f'Expected ThunksDB object: {path}')
-            for key in ('GL', 'Vulkan'):
-                if path == config or thunks.get(key) is not None:
-                    thunks.put(key, 0)
-        after = (encode(doc) + '\n').encode()
-        if after != before:
-            changes.append((path, before, after, path.stat()))
+    for path, after in desired:
+        if path.is_symlink() or (path.exists() and not path.is_file()):
+            raise ValueError(f'Expected regular file or absent path: {path}')
+        before = path.read_bytes() if path.exists() else None
+        if before != after:
+            changes.append((path, before, after, path.stat() if path.exists() else config.stat()))
     if not changes:
         print('Already selected; no files changed.')
         return
@@ -157,25 +172,29 @@ def enable(config, rootfs, prefix):
     # Back up every changed file before the first mutation.
     for i, (path, before, after, metadata) in enumerate(changes):
         saved = backup / f'{i}.original'
-        shutil.copy2(path, saved)
-        if saved.read_bytes() != before:
-            raise ValueError(f'Config changed while preparing backup: {path}')
-        records.append({'path': str(path), 'backup': saved.name,
+        if before is not None:
+            shutil.copy2(path, saved)
+            if saved.read_bytes() != before:
+                raise ValueError(f'File changed while preparing backup: {path}')
+        records.append({'path': str(path), 'backup': saved.name if before is not None else None,
                         'sha256': hashlib.sha256(after).hexdigest(),
                         'uid': metadata.st_uid, 'gid': metadata.st_gid})
     (backup / 'manifest.json').write_text(json.dumps(records, indent=2) + '\n')
     # Reject concurrent config edits instead of overwriting them.
     for path, before, _, _ in changes:
-        if path.read_bytes() != before:
+        if (path.read_bytes() if path.exists() else None) != before:
             raise ValueError(f'Config changed before activation: {path}')
     try:
         for path, _, after, metadata in changes:
             atomic_write(path, after, metadata)
     except BaseException:
         for path, before, _, metadata in changes:
-            atomic_write(path, before, metadata)
+            if before is None:
+                path.unlink(missing_ok=True)
+            else:
+                atomic_write(path, before, metadata)
         raise
-    print('Selected for all FEX guests; GL/Vulkan thunks disabled.')
+    print('Guest Mesa selected through rootfs ld.so.cache; user thunks preserved.')
     print(f'Backup: {backup}')
     print('Rollback: ' + shlex.join(['python3', str(Path(__file__).resolve()), 'rollback', str(backup)]))
 
@@ -185,17 +204,21 @@ def rollback(backup):
     # Check all files first; never discard a subsequent user edit.
     for r in records:
         path = Path(r['path'])
-        if path.is_symlink() or hashlib.sha256(path.read_bytes()).hexdigest() != r['sha256']:
+        if (path.is_symlink() or not path.is_file() or
+                hashlib.sha256(path.read_bytes()).hexdigest() != r['sha256']):
             raise ValueError(f'Config changed since activation; inspect backup before restoring: {path}')
     for r in records:
         path = Path(r['path'])
+        if r['backup'] is None:
+            path.unlink()
+            continue
         saved = backup / r['backup']
         metadata = saved.stat()
         atomic_write(path, saved.read_bytes(), metadata)
         if os.geteuid() == 0:
             os.chown(path, r['uid'], r['gid'])
         os.utime(path, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
-    print('Original FEX configuration restored; the Mesa payload and backup are retained.')
+    print('Original files restored; the Mesa payload and backup are retained.')
 
 
 def main():
@@ -213,7 +236,7 @@ def main():
             enable(args.config.absolute(), args.rootfs.resolve(), args.prefix)
         else:
             rollback(args.backup.resolve())
-    except (ValueError, OSError, KeyError) as e:
+    except (ValueError, OSError, KeyError, subprocess.CalledProcessError) as e:
         parser.exit(1, f'{e}\n')
 
 
